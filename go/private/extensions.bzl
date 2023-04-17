@@ -1,5 +1,34 @@
-load("//go/private:sdk.bzl", "go_download_sdk_rule", "go_host_sdk_rule", "go_multiple_toolchains")
+load("//go/private:sdk.bzl", "detect_host_platform", "go_download_sdk_rule", "go_host_sdk_rule", "go_multiple_toolchains")
 load("//go/private:repositories.bzl", "go_rules_dependencies")
+
+# Repository rule used to generate the `host_compatible_sdk` repository.
+# Which can be used to bootstrap gazelle instead of relying on go_default_sdk
+def host_compatible_toolchain_impl(rctx):
+    rctx.file("BUILD.bazel", content = "")
+    loads = []
+    host_compatible_labels = []
+    for i, l in enumerate(rctx.attr.toolchains):
+        if l.endswith(".bzl"):
+            # bzl file with a variable containing the toolchain label
+            # This indirection enables the user to generate the file differently depending on the environment.
+            # In particular the toolchain variable can be equal to None in which case it will be ignored
+            label = "toolchain_{}".format(i)
+            loads.append(
+                """load("{custom_toolchain}", {label} = "toolchain")""".format(custom_toolchain = l, label = label),
+            )
+        else:
+            label = """Label("{}")""".format(l)
+        host_compatible_labels.append(label)
+
+    rctx.file("defs.bzl", content = """
+{loads}
+host_compatible_label = {host_compatible_label}
+""".format(loads = "\n".join(loads), host_compatible_label = " or ".join(host_compatible_labels)))
+
+host_compatible_toolchain = repository_rule(
+    implementation = host_compatible_toolchain_impl,
+    attrs = {"toolchains": attr.string_list(mandatory = True)},
+)
 
 _download_tag = tag_class(
     attrs = {
@@ -20,6 +49,18 @@ _host_tag = tag_class(
     },
 )
 
+_custom_tag = tag_class(
+    doc = "Declare a custom toolchain to rules_go. It will then be considered when choosing the toolchain exposed by the `host_compatible_sdk` repository",
+    attrs = {
+        "custom_toolchain_bzl_file": attr.label(
+            doc = """bzl file containing a `toolchain` variable.
+This indirection enables the user to generate the file differently depending on the environment.
+In particular the toolchain variable can be equal to None in which case this custom toolchain will be ignored.
+""",
+        ),
+    },
+)
+
 # This limit can be increased essentially arbitrarily, but doing so will cause a rebuild of all
 # targets using any of these toolchains due to the changed repository name.
 _MAX_NUM_TOOLCHAINS = 9999
@@ -33,8 +74,18 @@ def _go_sdk_impl(ctx):
         else:
             multi_version_module[module.name] = False
 
+    host_detected_goos, host_detected_goarch = detect_host_platform(ctx)
     toolchains = []
+
+    # label of toolchains compatible with the current host
+    # declared with either download, host or custom tags
+    host_compatible_toolchains = []
+
     for module in ctx.modules:
+        for index, custom_tag in enumerate(module.tags.custom):
+            # Custom toolchains should contain a `toolchain` variable equal to None unless compatible with the host.
+            host_compatible_toolchains.append(str(custom_tag.custom_toolchain_bzl_file))
+
         for index, download_tag in enumerate(module.tags.download):
             # SDKs without an explicit version are fetched even when not selected by toolchain
             # resolution. This is acceptable if brought in by the root module, but transitive
@@ -65,6 +116,10 @@ def _go_sdk_impl(ctx):
                 urls = download_tag.urls,
                 version = download_tag.version,
             )
+
+            if not download_tag.goos or (download_tag.goos == host_detected_goos and download_tag.goarch == host_detected_goarch):
+                # Among toolchains defined with the download tag, we only consider those consistent with `detect_host_platform`
+                host_compatible_toolchains.append("@{}//:ROOT".format(name))
 
             toolchains.append(struct(
                 goos = download_tag.goos,
@@ -99,7 +154,9 @@ def _go_sdk_impl(ctx):
                 sdk_type = "host",
                 sdk_version = host_tag.version,
             ))
+            host_compatible_toolchains.append("@{}//:ROOT".format(name))
 
+    host_compatible_toolchain(name = "host_compatible_sdk", toolchains = host_compatible_toolchains)
     if len(toolchains) > _MAX_NUM_TOOLCHAINS:
         fail("more than {} go_sdk tags are not supported".format(_MAX_NUM_TOOLCHAINS))
 
@@ -150,6 +207,7 @@ go_sdk = module_extension(
     tag_classes = {
         "download": _download_tag,
         "host": _host_tag,
+        "custom": _custom_tag,
     },
 )
 
